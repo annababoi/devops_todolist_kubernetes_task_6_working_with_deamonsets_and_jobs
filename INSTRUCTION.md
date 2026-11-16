@@ -2,186 +2,131 @@
 
 ## Prerequisites
 
-- A running Kubernetes cluster and a configured `kubectl` client.
+- A running Kubernetes cluster with `kubectl` configured.
 - The Django ToDo application is running in the `mateapp` namespace.
-- A ClusterIP Service named `todoapp` exposes the application on port `80` in the same namespace.
+- A ClusterIP Service named `todoapp` in `mateapp` exposes the application on port `80`.
+- The `busyboxplus:curl` image is available to the cluster.
 
-Check the namespace, application pods, and Service before deploying:
+Run the commands in this document from the repository root.
 
 ```bash
 kubectl get namespace mateapp
 kubectl get pods -n mateapp
 kubectl get svc todoapp -n mateapp
+kubectl get endpointslices -n mateapp -l kubernetes.io/service-name=todoapp
 ```
 
-Both manifests use the `ikulyk404/busyboxplus:curl` container image and define CPU and memory resource requests and limits.
-
-## 1. Deploy the DaemonSet
-
-From the repository root, apply the DaemonSet manifest:
+If the ToDo application is not running yet, deploy its existing manifests and wait for the application to become ready:
 
 ```bash
-kubectl apply -f daemonset.yml
+kubectl apply -f .infrastructure/namespace.yml
+kubectl apply -f .infrastructure/deployment.yml
+kubectl apply -f .infrastructure/clusterIp.yml
 ```
 
-Check the rollout status and the DaemonSet:
+## 1. Deploy and validate the DaemonSet
 
 ```bash
-kubectl rollout status daemonset/todolist -n mateapp
+kubectl apply -f .infrastructure/daemonset.yml
+kubectl rollout status daemonset/todolist -n mateapp --timeout=180s
 kubectl get daemonset todolist -n mateapp
 kubectl get pods -n mateapp -l app=todolist -o wide
 ```
 
-The DaemonSet should run one Pod on each eligible node. The `DESIRED`, `CURRENT`, and `READY` counts should match once the rollout is complete.
+The DaemonSet runs one Pod on each eligible node. Its container uses `busyboxplus:curl`, defines CPU and memory requests and limits, and sends repeated HTTP requests to `http://todoapp:80`, with a five-second pause between requests.
 
-### Validate the DaemonSet
-
-The container sends a curl request to the ToDo application's ClusterIP Service every five seconds (with a five-second sleep between requests):
-
-```text
-http://todoapp:80
-```
-
-Display recent logs from all DaemonSet pods:
+Check that the DaemonSet has the expected number of ready Pods and review the logs from its Pods:
 
 ```bash
-kubectl logs -n mateapp -l app=todolist --all-containers=true --prefix=true --timestamps=true --tail=30
+kubectl logs -n mateapp -l app=todolist --prefix=true --timestamps=true --tail=40
 ```
 
-Follow the logs of a DaemonSet Pod to verify repeated requests:
+The logs should show repeated successful responses from the ToDo application. To follow the output live:
 
 ```bash
-kubectl logs -f daemonset/todolist -n mateapp --timestamps=true
+kubectl logs -n mateapp -l app=todolist --prefix=true --timestamps=true --follow --max-log-requests=20
 ```
 
-Expected result: the logs show repeated curl requests and responses from the ToDo application, with a five-second pause between requests. Check that there are no DNS or connection errors. Press `Ctrl+C` to stop following the logs.
+Press Ctrl+C to stop following the logs.
 
-## 2. Deploy the CronJob
-
-Apply the CronJob manifest:
+## 2. Deploy and validate the CronJob
 
 ```bash
-kubectl apply -f cronjob.yml
-```
-
-Check the CronJob configuration:
-
-```bash
+kubectl apply -f .infrastructure/cronjob.yml
 kubectl get cronjob todolist-cronjob -n mateapp
 kubectl describe cronjob todolist-cronjob -n mateapp
 ```
 
-The CronJob is configured as follows:
+The CronJob configuration is:
 
 | Setting | Value |
 | --- | --- |
-| Schedule | `*/4 * * * *` (every four minutes) |
+| Namespace | `mateapp` |
+| Container image | `busyboxplus:curl` |
+| Schedule | `*/4 * * * *` |
+| HTTP endpoint | `http://todoapp:80/api/health` |
 | Concurrency policy | `Allow` |
 | Successful Jobs history limit | `10` |
 | Failed Jobs history limit | `5` |
-| Starting deadline | `100` seconds |
 | Restart policy | `OnFailure` |
-| HTTP endpoint | `http://todoapp:80/api/health` |
 
-### Validate the CronJob
+CPU and memory requests and limits are defined in the manifest. The `curl -fsS` command returns a non-zero exit code on HTTP errors (4xx/5xx) or connection failures.
 
-Wait for the next scheduled execution and list the Jobs:
-
-```bash
-kubectl get jobs -n mateapp --watch
-```
-
-A Job with a name beginning with `todolist-cronjob-` should appear. Wait until the Job completes, then press `Ctrl+C` to stop watching.
-
-List the Jobs and their pods:
+Wait for a scheduled execution (up to four minutes until the next scheduled time), then check the Jobs:
 
 ```bash
-kubectl get jobs -n mateapp
+kubectl get jobs -n mateapp --sort-by=.metadata.creationTimestamp
 kubectl get pods -n mateapp
 ```
 
-To view the logs of a scheduled run, replace `<JOB_NAME>` with the actual name of a completed Job created by the CronJob:
+A successfully completed scheduled Job should have `1/1` in the COMPLETIONS column. Its name starts with `todolist-cronjob-`.
+
+To view the logs, replace `JOB_NAME` below with the actual name of a completed scheduled Job:
 
 ```bash
-kubectl logs -n mateapp job/<JOB_NAME>
+kubectl logs -n mateapp job/JOB_NAME --timestamps=true
 ```
 
-Expected result: the Job has `1/1` completions, and the logs contain the execution date and the health endpoint response, if it returns a body. The `curl -fsS` command reports HTTP errors (status 400 or higher) as failures.
+The logs show the execution date and the health endpoint response body, if one is returned. A completed Job confirms that the command exited successfully. The scheduled Job must be used as evidence; a manually triggered Job is not a substitute for this check.
 
-Verify that additional Jobs are created every four minutes:
+## 3. Record actual validation logs
+
+The following commands automatically select the latest successfully completed scheduled Job created by `todolist-cronjob` with the required image. They collect real DaemonSet and Job logs from the current cluster and append them to `INSTRUCTION.md`. Python 3 is required for selecting the Job. Run the complete block once from the repository root after applying both manifests and waiting for a successful scheduled run.
 
 ```bash
-kubectl get cronjob todolist-cronjob -n mateapp
-kubectl get jobs -n mateapp --sort-by=.metadata.creationTimestamp
+(
+  set -e
+  kubectl rollout status daemonset/todolist -n mateapp --timeout=180s
+  JOB=$(kubectl get jobs -n mateapp -o json | python3 -c 'import json,sys; jobs=[j for j in json.load(sys.stdin)["items"] if any(o.get("kind")=="CronJob" and o.get("name")=="todolist-cronjob" for o in j["metadata"].get("ownerReferences",[])) and any(c.get("type")=="Complete" and c.get("status")=="True" for c in j.get("status",{}).get("conditions",[])) and any(c.get("image")=="busyboxplus:curl" for c in j["spec"]["template"]["spec"]["containers"])]; print(max(jobs,key=lambda j:j["metadata"]["creationTimestamp"])["metadata"]["name"] if jobs else "")')
+  if [ -z "$JOB" ]; then
+    echo "No completed scheduled Job with the required image yet. Wait for the next scheduled run and retry." >&2
+    exit 1
+  fi
+  kubectl wait --for=condition=complete "job/$JOB" -n mateapp --timeout=60s
+  DS_LOGS=$(kubectl logs -n mateapp -l app=todolist --prefix=true --timestamps=true --since=25s --tail=-1)
+  JOB_LOGS=$(kubectl logs -n mateapp "job/$JOB" --timestamps=true)
+  if [ -z "$DS_LOGS" ] || [ -z "$JOB_LOGS" ]; then
+    echo "Logs are empty. Check the Pods and retry." >&2
+    exit 1
+  fi
+  {
+    printf '\n## 5. Actual validation logs\n\n'
+    printf '### DaemonSet: todolist\n\n'
+    printf '%s\n' '```text' "$DS_LOGS" '```'
+    printf '\n### Scheduled CronJob: %s\n\n' "$JOB"
+    printf '%s\n' '```text' "$JOB_LOGS" '```'
+  } >> INSTRUCTION.md
+  echo "Actual validation logs appended to INSTRUCTION.md"
+)
 ```
 
-### Optional: test the CronJob immediately
+Review the captured output to confirm successful HTTP responses and the completed scheduled Job before committing the file.
 
-A manual Job can be created from the CronJob without waiting for the next scheduled run:
+## 4. Cleanup (optional)
 
 ```bash
-kubectl create job todolist-test --from=cronjob/todolist-cronjob -n mateapp
-kubectl wait --for=condition=complete job/todolist-test -n mateapp --timeout=120s
-kubectl logs -n mateapp job/todolist-test
+kubectl delete -f .infrastructure/daemonset.yml
+kubectl delete -f .infrastructure/cronjob.yml
 ```
 
-If the Job does not complete, inspect its status and pod logs:
-
-```bash
-kubectl describe job todolist-test -n mateapp
-kubectl get pods -n mateapp -l job-name=todolist-test
-kubectl logs -n mateapp job/todolist-test
-```
-
-Remove the manual test Job when finished:
-
-```bash
-kubectl delete job todolist-test -n mateapp
-```
-
-If the endpoint returns a redirect, inspect the HTTP status and check the Django URL configuration (including whether `/api/health/` is required). A redirect alone does not prove that the health endpoint succeeded.
-
-The manual test verifies the command and endpoint. A scheduled Job must also be checked to verify the actual CronJob schedule.
-
-## 3. Validation checklist
-
-- [ ] The DaemonSet is deployed in `mateapp`, and one Pod is ready on each eligible node.
-- [ ] DaemonSet logs show repeated curl requests to the `todoapp` ClusterIP Service approximately every five seconds.
-- [ ] The CronJob is deployed in `mateapp` and creates Jobs every four minutes.
-- [ ] A scheduled Job completes successfully and its logs show the execution date and health-check result (if the response has a body).
-- [ ] The CronJob uses `Allow`, a successful history limit of `10`, and a failed history limit of `5`.
-- [ ] Both manifests specify CPU and memory requests and limits.
-
-## 4. Collect validation logs
-
-After a successful deployment, collect real log output for the submission. Run the following commands from the repository root:
-
-```bash
-kubectl logs -n mateapp -l app=todolist --all-containers=true --prefix=true --timestamps=true --tail=30 | tee daemonset-validation.log
-kubectl logs -n mateapp job/<JOB_NAME> --timestamps=true | tee cronjob-validation.log
-```
-
-Replace `<JOB_NAME>` with the name of an actual completed, scheduled Job before running the second command. If the assignment requires log output directly in this document, paste the contents of these two log files below.
-
-**DaemonSet logs:**
-
-```text
-Paste actual DaemonSet log output here after validation.
-```
-
-**CronJob logs:**
-
-```text
-Paste actual scheduled CronJob log output here after validation.
-```
-
-## 5. Cleanup (optional)
-
-After validation, remove the resources if they are no longer needed:
-
-```bash
-kubectl delete -f cronjob.yml
-kubectl delete -f daemonset.yml
-```
-
-This does not remove the existing ToDo application or its ClusterIP Service.
+This removes the DaemonSet and CronJob without removing the existing ToDo application or its ClusterIP Service.
